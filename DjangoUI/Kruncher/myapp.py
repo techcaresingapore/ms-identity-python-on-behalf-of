@@ -1,6 +1,6 @@
 import msal
 import requests
-from flask import Flask, redirect, request, url_for, session
+from flask import Flask, redirect, request, session, url_for
 import os
 from os.path import join, dirname
 from dotenv import load_dotenv
@@ -14,7 +14,7 @@ CLIENT_ID = os.environ.get("CLIENT_ID")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
 REDIRECT_URI = os.environ.get("REDIRECT_URI")
 AUTHORITY = os.environ.get("AUTHORITY")  # Use the common endpoint
-SCOPE = os.environ.get("SCOPE")
+SCOPE = os.environ.get("SCOPE").split()
 
 # Initialize the MSAL confidential client application
 app = msal.ConfidentialClientApplication(
@@ -31,7 +31,7 @@ flask_app.secret_key = os.environ.get("FLASK_SECRET_KEY", "default_secret_key")
 def index():
     # Build the authorization URL to get the authorization code
     auth_url = app.get_authorization_request_url(
-        scopes=SCOPE.split(),
+        scopes=SCOPE,
         redirect_uri=REDIRECT_URI,
     )
     return redirect(auth_url)
@@ -45,27 +45,60 @@ def callback():
     # Exchange the authorization code for an access token
     token_response = app.acquire_token_by_authorization_code(
         code=authorization_code,
-        scopes=SCOPE.split(),
+        scopes=SCOPE,
         redirect_uri=REDIRECT_URI,
     )
 
-    print("token_response")
-    print(token_response)
-    print("\n")
+    if "error" in token_response:
+        return f"Failed to acquire token: {token_response.get('error_description')}"
 
-    access_token = token_response.get("access_token")
-    if not access_token:
-        return f"Could not obtain access token: {token_response.get('error_description')}"
+    # Store tokens in session
+    session["token_cache"] = token_response
 
-    # Extract ID token claims
-    id_token_claims = token_response.get("id_token_claims", {})
-    tenant_id = id_token_claims.get("tid")
-    if not tenant_id:
-        return "Tenant ID not found in the ID token"
+    return redirect(url_for('send_mail'))
 
+def get_token():
+    token_cache = session.get("token_cache")
+    if not token_cache:
+        return None
+
+    # Fetch the account
+    accounts = app.get_accounts()
+
+    # There should be only one account in this case
+    if not accounts:
+        return None
+
+    result = app.acquire_token_silent(SCOPE, account=accounts[0])
     
+    if not result:
+        print("No result from acquire_token_silent.")
+        return None
 
-    # Send an email using Microsoft Graph API
+    if "access_token" in result:
+        return result["access_token"]
+
+    if "error" in result:
+        print(f"Error acquiring token: {result['error']}")
+        return None
+
+    if "refresh_token" in token_cache:
+        result = app.acquire_token_by_refresh_token(
+            token_cache['refresh_token'],
+            SCOPE
+        )
+        if "access_token" in result:
+            session["token_cache"] = result
+            return result["access_token"]
+
+    return None
+
+@flask_app.route('/send_mail', methods=['GET', 'POST'])
+def send_mail():
+    access_token = get_token()
+    if not access_token:
+        return redirect(url_for('index'))
+
     email_data = {
         "message": {
             "subject": "Test Email",
@@ -83,10 +116,6 @@ def callback():
         },
         "saveToSentItems": "true"
     }
-
-    print("id_token_claims")
-    print(id_token_claims)
-    print("\n")
 
     send_mail_response = requests.post(
         'https://graph.microsoft.com/v1.0/me/sendMail',
